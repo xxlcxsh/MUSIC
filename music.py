@@ -1,265 +1,260 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-2D Near-field MUSIC Localization (Broadband ISSM)
-Поддержка .aup / .wav, блочная обработка, CLI-параметры.
-Исправлено: устойчивость к NaN/Inf, очистка данных, диагностика.
+CLI для широкополосного near-field MUSIC.
+Пример:
+  python music.py audio/A1_CH_10_20.aup
+  python music.py --batch audio --output results.csv
+  python music.py audio/A1_CH_10_20.aup --visual --visual-dir viz_out
 """
 
+from __future__ import annotations
+
 import argparse
+import csv
+import glob
 import os
 import sys
-import glob
-import xml.etree.ElementTree as ET
-import numpy as np
-import scipy.signal as sig
-import matplotlib.pyplot as plt
-import soundfile as sf
+from datetime import datetime
 
-# ================= КОНФИГУРАЦИЯ РЕШЁТКИ =================
-NUM_MICS = 8
-MIC_X = np.array([-0.14, -0.10, -0.06, -0.02, 0.02, 0.06, 0.10, 0.14])
-MIC_Y = np.zeros(NUM_MICS)
+from music_core import (
+    C_SOUND_DEFAULT,
+    FS_DEFAULT,
+    load_audacity_or_wav,
+    music_localization,
+    parse_ground_truth_from_filename,
+)
+from music_visualize import save_all_visualizations
 
-# ================= ПАРАМЕТРЫ АЛГОРИТМА =================
-FS_DEFAULT = 44100.0
-FREQ_RANGE = (300.0, 4000.0)
-THETA_DEG = np.arange(-90, 91, 1)
-R_METERS = np.arange(0.2, 2.05, 0.05)
-K_SOURCES = 1
-# ========================================================
 
-def strip_xml_namespaces(root):
-    for elem in root.iter():
-        if '}' in elem.tag:
-            elem.tag = elem.tag.split('}', 1)[1]
-    return root
+def process_file(
+    audio_path: str,
+    *,
+    c: float = C_SOUND_DEFAULT,
+    block_start: int = 0,
+    block_len: int = 88200,
+    num_sources: int = 1,
+    visual: bool = False,
+    visual_dir: str | None = None,
+    full_3d: bool = False,
+) -> dict:
+    x, sr = load_audacity_or_wav(audio_path)
+    end = min(block_start + block_len, x.shape[1])
+    segment = x[:, block_start:end]
+    if segment.shape[1] < 1024:
+        raise ValueError("Блок слишком короткий (<1024 отсчётов)")
 
-def load_audacity_or_wav(filepath):
-    if not os.path.exists(filepath):
-        raise FileNotFoundError(f"Файл не найден: {filepath}")
+    result = music_localization(
+        segment,
+        sr,
+        num_sources=num_sources,
+        c=c,
+        return_diagnostics=visual,
+        full_3d=full_3d,
+    )
 
-    ext = os.path.splitext(filepath)[1].lower()
+    gt = parse_ground_truth_from_filename(audio_path)
+    if visual:
+        base = os.path.splitext(os.path.basename(audio_path))[0]
+        out = visual_dir or os.path.join("visualizations", base)
+        save_all_visualizations(result, out, title_prefix=base, ground_truth=gt)
 
-    if ext in ['.wav', '.flac', '.ogg', '.aiff']:
-        print(f"📂 Загрузка через soundfile: {filepath}")
-        data, sr = sf.read(filepath, always_2d=True)
-        X = data.T
-        if X.shape[0] != NUM_MICS:
-            raise ValueError(f"Ожидалось {NUM_MICS} каналов, получено {X.shape[0]}.")
-        return X, sr
+    row = {
+        "filename": os.path.basename(audio_path),
+        "azimuth_deg": round(result.azimuth_deg, 2),
+        "elevation_deg": round(result.elevation_deg, 2),
+        "distance_m": round(result.distance_m, 3),
+        "gt_azimuth_deg": round(gt[0], 2) if gt else "",
+        "gt_distance_m": round(gt[1], 3) if gt else "",
+        "error": "",
+    }
+    return row
 
-    if ext == '.aup':
-        print(f"📂 Парсинг Audacity проекта: {filepath}")
+
+def batch_process(
+    audio_dir: str,
+    output_csv: str | None = None,
+    *,
+    c: float = C_SOUND_DEFAULT,
+    block_start: int = 0,
+    block_len: int = 88200,
+    num_sources: int = 1,
+    visual: bool = False,
+    visual_root: str = "visualizations",
+    full_3d: bool = False,
+) -> list[dict]:
+    patterns = [
+        os.path.join(audio_dir, "*.aup"),
+        os.path.join(audio_dir, "*.wav"),
+        os.path.join(audio_dir, "*.flac"),
+    ]
+    files: list[str] = []
+    for pattern in patterns:
+        files.extend(glob.glob(pattern))
+    files = sorted(set(files))
+
+    if not files:
+        raise FileNotFoundError(f"В {audio_dir} не найдено .aup/.wav/.flac файлов")
+
+    if output_csv is None:
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        output_csv = f"music_results_{ts}.csv"
+
+    results: list[dict] = []
+    print(f"Batch: {len(files)} files -> {output_csv}")
+
+    for i, path in enumerate(files, 1):
+        name = os.path.basename(path)
+        print(f"[{i}/{len(files)}] {name}")
         try:
-            tree = ET.parse(filepath)
-            root = strip_xml_namespaces(tree.getroot())
-        except ET.ParseError as e:
-            raise RuntimeError(f"Ошибка парсинга XML: {e}")
+            vdir = os.path.join(visual_root, os.path.splitext(name)[0]) if visual else None
+            row = process_file(
+                path,
+                c=c,
+                block_start=block_start,
+                block_len=block_len,
+                num_sources=num_sources,
+                visual=visual,
+                visual_dir=vdir,
+                full_3d=full_3d,
+            )
+            print(
+                f"    azimuth={row['azimuth_deg']} deg, elevation={row['elevation_deg']} deg, "
+                f"distance={row['distance_m']} m"
+            )
+        except Exception as exc:
+            row = {
+                "filename": name,
+                "azimuth_deg": "",
+                "elevation_deg": "",
+                "distance_m": "",
+                "gt_azimuth_deg": "",
+                "gt_distance_m": "",
+                "error": str(exc)[:200],
+            }
+            print(f"    Ошибка: {exc}")
 
-        project_dir = os.path.dirname(os.path.abspath(filepath))
-        base_name = os.path.splitext(os.path.basename(filepath))[0]
-        data_dir = os.path.join(project_dir, f"{base_name}_data")
-        if not os.path.isdir(data_dir):
-            candidates = glob.glob(os.path.join(project_dir, "*_data"))
-            data_dir = candidates[0] if candidates else data_dir
+        results.append(row)
 
-        tracks = root.findall('.//wavetrack')
-        if len(tracks) < NUM_MICS:
-            raise ValueError(f"В проекте {len(tracks)} дорожек. Требуется {NUM_MICS}.")
+    fieldnames = [
+        "filename",
+        "azimuth_deg",
+        "elevation_deg",
+        "distance_m",
+        "gt_azimuth_deg",
+        "gt_distance_m",
+        "error",
+    ]
+    with open(output_csv, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(results)
 
-        X_list = []
-        for idx, track in enumerate(tracks[:NUM_MICS]):
-            blocks = track.findall('.//waveblock')
-            if not blocks:
-                raise ValueError(f"Дорожка {idx+1} пуста.")
-            
-            block_info = []
-            for b in blocks:
-                start = float(b.get('start', 0))
-                fname = b.get('filename')
-                if not fname:
-                    sbf = b.find('.//simpleblockfile')
-                    if sbf is not None:
-                        fname = sbf.get('filename')
-                if fname:
-                    block_info.append((start, fname))
-            
-            block_info.sort(key=lambda x: x[0])
-            track_samples = []
-            for _, fname in block_info:
-                au_path = os.path.join(data_dir, fname)
-                if not os.path.exists(au_path):
-                    found = glob.glob(os.path.join(data_dir, '**', fname), recursive=True)
-                    au_path = found[0] if found else au_path
-                track_samples.append(np.fromfile(au_path, dtype='<f4'))
-            X_list.append(np.concatenate(track_samples))
-
-        min_len = min(len(ch) for ch in X_list)
-        X = np.array([ch[:min_len] for ch in X_list])
-        print(f"✅ Собрано {X.shape[0]} каналов, {X.shape[1]} отсчётов.")
-        return X, FS_DEFAULT
-
-    if ext == '.aup3':
-        raise NotImplementedError("Формат .aup3 не поддерживается. Экспортируйте в WAV.")
-    raise ValueError(f"Неподдерживаемое расширение: {ext}")
+    ok = sum(1 for r in results if not r["error"])
+    print(f"Готово: {ok}/{len(files)} успешно. CSV: {output_csv}")
+    return results
 
 
-def preprocess_signals(X, fs):
-    print("🔧 Предобработка...")
-    # 1. Центрирование
-    X = X - np.mean(X, axis=1, keepdims=True)
-    # 2. Фильтрация
-    sos = sig.butter(4, FREQ_RANGE, btype='band', fs=fs, output='sos')
-    X = sig.sosfilt(sos, X, axis=1)
-    # 3. Очистка от выбросов и NaN/Inf (критично для STFT и eigh)
-    X = np.clip(X, -1e3, 1e3)
-    X = np.nan_to_num(X, nan=0.0, posinf=1e3, neginf=-1e3)
-    
-    if not np.all(np.isfinite(X)):
-        raise ValueError("Сигнал содержит нечисловые значения после предобработки.")
-    return X
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Широкополосный near-field MUSIC (8-канальная решётка)"
+    )
+    parser.add_argument(
+        "audio_file",
+        nargs="?",
+        help="Путь к .aup / многоканальному .wav",
+    )
+    parser.add_argument(
+        "--batch",
+        type=str,
+        metavar="DIR",
+        help="Пакетная обработка всех файлов в каталоге",
+    )
+    parser.add_argument(
+        "--output",
+        type=str,
+        default=None,
+        help="CSV для пакетного режима",
+    )
+    parser.add_argument("--speed-of-sound", type=float, default=C_SOUND_DEFAULT, metavar="C")
+    parser.add_argument("--block-start", type=int, default=0)
+    parser.add_argument("--block-len", type=int, default=88200)
+    parser.add_argument("--num-sources", type=int, default=1)
+    parser.add_argument(
+        "--visual",
+        action="store_true",
+        help="Сохранить подробные визуализации в отдельную директорию",
+    )
+    parser.add_argument(
+        "--visual-dir",
+        type=str,
+        default=None,
+        help="Каталог визуализаций (одиночный файл)",
+    )
+    parser.add_argument(
+        "--visual-root",
+        type=str,
+        default="visualizations",
+        help="Корень визуализаций в пакетном режиме",
+    )
+    parser.add_argument(
+        "--full-3d",
+        action="store_true",
+        help="Полная 3D-сетка (theta, phi, d) по instruction.md вместо планарной 2D",
+    )
 
-
-def compute_nearfield_music(X, fs, c, mic_x, mic_y, thetas_deg, rs, freq_range):
-    print("📐 Расчёт широкополосного MUSIC...")
-    nperseg, noverlap = 1024, 512
-    f, t, Zxx = sig.stft(X, fs=fs, nperseg=nperseg, noverlap=noverlap)
-    
-    # Безопасная очистка выхода STFT
-    Zxx = np.nan_to_num(Zxx, nan=0.0, posinf=1e3, neginf=-1e3)
-    
-    freq_mask = (f >= freq_range[0]) & (f <= freq_range[1])
-    f_sel, Zxx_sel = f[freq_mask], Zxx[:, freq_mask, :]
-    if len(f_sel) == 0:
-        raise ValueError("Нет бинов в рабочем диапазоне частот.")
-    print(f"   Рабочий диапазон: {freq_range[0]}-{freq_range[1]} Гц, бинов: {len(f_sel)}")
-        
-    thetas_rad = np.deg2rad(thetas_deg)
-    R_grid, Theta_grid = np.meshgrid(rs, thetas_rad, indexing='ij')
-    Xs = R_grid * np.sin(Theta_grid)
-    Ys = R_grid * np.cos(Theta_grid)
-    dists = np.sqrt((Xs[..., None] - mic_x)**2 + (Ys[..., None] - mic_y)**2)
-    
-    P_total = np.zeros_like(R_grid)
-    valid_bins = 0
-    skipped_eigh = 0
-    
-    for i, freq in enumerate(f_sel):
-        X_f = Zxx_sel[:, i, :]
-        T_frames = X_f.shape[1]
-        if T_frames == 0:
-            continue
-            
-        R_xx = (X_f @ X_f.conj().T) / T_frames
-        # Принудительная эрмитовость и регуляризация
-        R_xx = (R_xx + R_xx.conj().T) * 0.5
-        R_xx += np.eye(NUM_MICS) * 1e-6 * (np.trace(R_xx) / NUM_MICS)
-        
-        try:
-            w, v = np.linalg.eigh(R_xx)
-        except np.linalg.LinAlgError:
-            w, v = np.linalg.eig(R_xx)
-            w = np.real(w)
-            skipped_eigh += 1
-            
-        idx = np.argsort(w)[::-1]
-        v = v[:, idx]
-        En = v[:, K_SOURCES:]
-        
-        k = 2 * np.pi * freq / c
-        A = np.exp(-1j * k * dists)
-        EnH_A = np.einsum('ij,klj->kli', En.conj().T, A)
-        denom = np.sum(np.abs(EnH_A)**2, axis=2)
-        P_f = 1.0 / (denom + 1e-12)
-        
-        max_p = np.max(P_f)
-        P_total += P_f / max_p
-        valid_bins += 1
-            
-        if (i + 1) % 20 == 0 or i == len(f_sel) - 1:
-            print(f"   Частотные бины: {i+1}/{len(f_sel)} (валидных: {valid_bins})")
-            
-    if valid_bins == 0:
-        raise RuntimeError("Не удалось обработать ни один частотный бин. Проверьте данные или диапазон частот.")
-    if skipped_eigh > 0:
-        print(f"   ️ Пропущено разложений eigh: {skipped_eigh}")
-        
-    P_avg = P_total / valid_bins
-    return 10 * np.log10(P_avg / np.max(P_avg) + 1e-12), P_avg
-
-
-def plot_heatmap(P_dB, thetas_deg, rs, peak_theta, peak_r):
-    print("🎨 Визуализация...")
-    plt.figure(figsize=(10, 6))
-    th_e = np.append(thetas_deg, thetas_deg[-1] + 1)
-    r_e = np.append(rs, rs[-1] + 0.05)
-    pcm = plt.pcolormesh(th_e, r_e, P_dB, shading='flat', cmap='inferno')
-    plt.colorbar(pcm, label='MUSIC Spectrum (dB)').set_ticks([-40, -30, -20, -10, 0])
-    plt.scatter(peak_theta, peak_r, c='cyan', marker='x', s=150, linewidths=3,
-                label=f'Пик: θ={peak_theta:.1f}°, r={peak_r:.2f} м')
-    plt.title('2D Near-field MUSIC (Broadband ISSM)', fontsize=14, pad=10)
-    plt.xlabel('Угол θ (°)'); plt.ylabel('Расстояние r (м)')
-    plt.grid(True, ls='--', alpha=0.5); plt.legend(loc='upper right')
-    plt.tight_layout(); plt.show()
-
-
-def run(audio_path, c=343.0, block_start=0, block_len=88200, show_plot=True):
-    print(f"\n{'─'*60}")
-    print(" 2D Near-field MUSIC Localization")
-    print(f"{'─'*60}")
-    
-    X, sr = load_audacity_or_wav(audio_path)
-    current_fs = sr
-    if sr != FS_DEFAULT:
-        print(f"⚠️ Fs файла ({sr} Гц) != конфиг ({FS_DEFAULT} Гц). Используется Fs файла.")
-
-    end = min(block_start + block_len, X.shape[1])
-    X_seg = X[:, block_start:end]
-    if X_seg.shape[1] < 1024:
-        raise ValueError("Блок слишком короткий для STFT (минимум 1024 отсчёта).")
-    print(f"📦 Обрабатываем блок: [{block_start}:{end}] ({X_seg.shape[1]} отсчётов)")
-
-    X_proc = preprocess_signals(X_seg, current_fs)
-    P_dB, P_lin = compute_nearfield_music(X_proc, current_fs, c, MIC_X, MIC_Y, THETA_DEG, R_METERS, FREQ_RANGE)
-
-    max_idx = np.unravel_index(np.argmax(P_lin), P_lin.shape)
-    est_r = R_METERS[max_idx[0]]
-    est_theta = THETA_DEG[max_idx[1]]
-
-    print(f"\n{'═'*60}")
-    print(" 🎯 РЕЗУЛЬТАТ ЛОКАЛИЗАЦИИ:")
-    print(f"    Угол (градусы): {est_theta:.1f}")
-    print(f"    Расстояние (м): {est_r:.2f}")
-    print(f"{'═'*60}\n")
-
-    if show_plot:
-        plot_heatmap(P_dB, THETA_DEG, R_METERS, est_theta, est_r)
-    return est_theta, est_r
-
-
-def main():
-    parser = argparse.ArgumentParser(description="2D Near-field MUSIC Sound Source Localization")
-    parser.add_argument('audio_file', help='Путь к .aup или многоканальному .wav')
-    parser.add_argument('--speed-of-sound', type=float, default=343.0, metavar='C', help='Скорость звука (м/с)')
-    parser.add_argument('--block-start', type=int, default=0, help='Начальный отсчёт блока')
-    parser.add_argument('--block-len', type=int, default=88200, help='Длина блока в отсчётах (по умолчанию 2 сек)')
-    parser.add_argument('--no-plot', action='store_true', help='Отключить построение графика')
     args = parser.parse_args()
 
+    if args.batch:
+        if not os.path.isdir(args.batch):
+            print(f"Директория не найдена: {args.batch}", file=sys.stderr)
+            sys.exit(1)
+        try:
+            batch_process(
+                args.batch,
+                args.output,
+                c=args.speed_of_sound,
+                block_start=args.block_start,
+                block_len=args.block_len,
+                num_sources=args.num_sources,
+                visual=args.visual,
+                visual_root=args.visual_root,
+                full_3d=args.full_3d,
+            )
+        except Exception as exc:
+            print(f"Ошибка: {exc}", file=sys.stderr)
+            sys.exit(1)
+        return
+
+    if not args.audio_file:
+        parser.error("Укажите audio_file или --batch DIR")
+
     try:
-        run(
-            audio_path=args.audio_file,
+        row = process_file(
+            args.audio_file,
             c=args.speed_of_sound,
             block_start=args.block_start,
             block_len=args.block_len,
-            show_plot=not args.no_plot
+            num_sources=args.num_sources,
+            visual=args.visual,
+            visual_dir=args.visual_dir,
+            full_3d=args.full_3d,
         )
-    except Exception as e:
-        print(f"\n❌ Ошибка: {e}")
+        print("\n" + "=" * 60)
+        print(" LOCALIZATION RESULT")
+        print(f"  Azimuth (deg):    {row['azimuth_deg']}")
+        print(f"  Elevation (deg):  {row['elevation_deg']}")
+        print(f"  Distance (m):     {row['distance_m']}")
+        if row["gt_azimuth_deg"] != "":
+            print(f"  Ground truth:     azimuth={row['gt_azimuth_deg']}, distance={row['gt_distance_m']} m")
+        print("=" * 60 + "\n")
+    except Exception as exc:
+        print(f"Ошибка: {exc}", file=sys.stderr)
         import traceback
+
         traceback.print_exc()
         sys.exit(1)
 
-if __name__ == '__main__':
+
+if __name__ == "__main__":
     main()
