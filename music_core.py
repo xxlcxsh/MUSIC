@@ -13,12 +13,13 @@ from typing import Optional, Tuple
 import numpy as np
 import scipy.signal as sig
 
-# --- Геометрия решётки (из music.py) ---
+# --- Геометрия: 8 микрофонов на окружности (как sound_direction.py) ---
 NUM_MICS = 8
-MIC_X = np.array([-0.14, -0.10, -0.06, -0.02, 0.02, 0.06, 0.10, 0.14], dtype=np.float64)
-MIC_Y = np.zeros(NUM_MICS, dtype=np.float64)
+ARRAY_RADIUS_M = 0.5  # м, диаметр 1 м
+_MIC_ANGLES = np.linspace(0.0, 2.0 * np.pi, NUM_MICS, endpoint=False)
+MIC_X = (ARRAY_RADIUS_M * np.cos(_MIC_ANGLES)).astype(np.float64)
+MIC_Y = (ARRAY_RADIUS_M * np.sin(_MIC_ANGLES)).astype(np.float64)
 MIC_Z = np.zeros(NUM_MICS, dtype=np.float64)
-ARRAY_RADIUS_M = float(np.max(np.hypot(MIC_X, MIC_Y)))
 
 # --- Параметры по умолчанию ---
 FS_DEFAULT = 44100.0
@@ -99,49 +100,15 @@ def load_audacity_or_wav(filepath: str) -> Tuple[np.ndarray, float]:
         return x.astype(np.float64), float(sr)
 
     if ext == ".aup":
-        tree = ET.parse(filepath)
-        root = strip_xml_namespaces(tree.getroot())
-        project_dir = os.path.dirname(os.path.abspath(filepath))
-        base_name = os.path.splitext(os.path.basename(filepath))[0]
-        data_dir = os.path.join(project_dir, f"{base_name}_data")
-        if not os.path.isdir(data_dir):
-            candidates = glob.glob(os.path.join(project_dir, "*_data"))
-            data_dir = candidates[0] if candidates else data_dir
+        # Та же загрузка, что в sound_direction.py (simpleblockfile + os.walk + AU/SF).
+        from sound_direction import load_aup_xml
 
-        tracks = root.findall(".//wavetrack")
+        tracks, sr = load_aup_xml(filepath)
         if len(tracks) < NUM_MICS:
             raise ValueError(f"В проекте {len(tracks)} дорожек, требуется {NUM_MICS}.")
-
-        channels = []
-        for track in tracks[:NUM_MICS]:
-            blocks = track.findall(".//waveblock")
-            if not blocks:
-                raise ValueError("Пустая дорожка в проекте.")
-            block_info = []
-            for block in blocks:
-                start = float(block.get("start", 0))
-                sbf = block.find(".//simpleblockfile")
-                fname = block.get("filename")
-                length = None
-                if sbf is not None:
-                    fname = fname or sbf.get("filename")
-                    if sbf.get("len"):
-                        length = int(sbf.get("len"))
-                if fname:
-                    block_info.append((start, fname, length))
-            block_info.sort(key=lambda x: x[0])
-            samples = []
-            for _, fname, length in block_info:
-                au_path = os.path.join(data_dir, fname)
-                if not os.path.exists(au_path):
-                    found = glob.glob(os.path.join(data_dir, "**", fname), recursive=True)
-                    au_path = found[0] if found else au_path
-                samples.append(read_audacity_au_block(au_path, length))
-            channels.append(np.concatenate(samples))
-
-        min_len = min(len(ch) for ch in channels)
-        x = np.array([ch[:min_len] for ch in channels], dtype=np.float64)
-        return x, FS_DEFAULT
+        min_len = min(len(t) for t in tracks[:NUM_MICS])
+        x = np.array([tracks[i][:min_len] for i in range(NUM_MICS)], dtype=np.float64)
+        return x, float(sr)
 
     if ext == ".aup3":
         raise NotImplementedError("Формат .aup3 не поддерживается. Экспортируйте в WAV.")
@@ -218,26 +185,64 @@ def _grid_positions(
     return sx.ravel(), sy.ravel(), sz.ravel(), dd.ravel()
 
 
-def _grid_positions_planar(
+def _grid_positions_circular_planar(
     azimuth_deg: np.ndarray,
     d_m: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Планарная модель для линейной решётки (координаты из music.py):
-    x = d·sin(θ), y = d·cos(θ), z = 0.
-    Азимут θ — угол от оси +Y, совпадает с разметкой в именах файлов.
+    Источник в плоскости XY; азимут — как в sound_direction.py:
+    0° = ось +X, против часовой стрелки; x = d·cos(θ), y = d·sin(θ).
     """
     tt, dd = np.meshgrid(np.deg2rad(azimuth_deg), d_m, indexing="ij")
-    sx = dd * np.sin(tt)
-    sy = dd * np.cos(tt)
+    sx = dd * np.cos(tt)
+    sy = dd * np.sin(tt)
     sz = np.zeros_like(sx)
     return sx.ravel(), sy.ravel(), sz.ravel(), dd.ravel()
 
 
-def legacy_azimuth_to_instruction(azimuth_legacy_deg: float) -> float:
-    """Преобразование в азимут instruction.md (0–360°, от оси +X в плоскости XY)."""
-    rad = np.deg2rad(azimuth_legacy_deg)
-    return float(np.degrees(np.arctan2(np.cos(rad), np.sin(rad))) % 360.0)
+def _music_quadratic_denom(steering: np.ndarray, p_n: np.ndarray) -> np.ndarray:
+    """a^H P_n a для пакета векторов управления (G, M)."""
+    sp = steering @ p_n
+    return np.real(np.sum(steering * np.conj(sp), axis=1))
+
+
+def _music_spectrum_farfield_doa(
+    azimuth_deg: np.ndarray,
+    mic_x: np.ndarray,
+    mic_y: np.ndarray,
+    projectors: list[np.ndarray],
+    freqs: np.ndarray,
+    c: float,
+) -> np.ndarray:
+    """Широкополосный MUSIC (дальнее поле) по азимуту 0–360°."""
+    theta = np.deg2rad(azimuth_deg)
+    cos_t = np.cos(theta)[:, None]
+    sin_t = np.sin(theta)[:, None]
+    p_sum = np.zeros(len(azimuth_deg), dtype=np.float64)
+
+    for p_n, freq in zip(projectors, freqs):
+        tau = -(mic_x[None, :] * cos_t + mic_y[None, :] * sin_t) / c
+        steering = np.exp(-1j * 2.0 * np.pi * freq * tau)
+        p_sum += 1.0 / (_music_quadratic_denom(steering, p_n) + 1e-12)
+
+    return p_sum
+
+
+def _fine_azimuth_range(
+    azimuth_peak: float,
+    half_width: float,
+    step: float,
+) -> np.ndarray:
+    """Узкий диапазон азимута с учётом перехода через 0°/360°."""
+    center = azimuth_peak % 360.0
+    n = int(np.ceil(2.0 * half_width / step)) + 1
+    offsets = np.linspace(-half_width, half_width, n)
+    return (center + offsets) % 360.0
+
+
+def legacy_azimuth_to_instruction(azimuth_deg: float) -> float:
+    """Азимут уже в системе instruction.md (0–360°, от +X)."""
+    return float(azimuth_deg % 360.0)
 
 
 def _music_spectrum_on_grid(
@@ -264,9 +269,7 @@ def _music_spectrum_on_grid(
     for p_n, freq in zip(projectors, freqs):
         phase = np.exp(-1j * 2.0 * np.pi * freq / c * (d_mics - d_flat[:, None]))
         steering = (d_flat[:, None] / np.maximum(d_mics, 1e-9)) * phase
-        proj = steering @ p_n.T
-        denom = np.sum(np.abs(proj) ** 2, axis=1)
-        p_sum += 1.0 / (denom + 1e-12)
+        p_sum += 1.0 / (_music_quadratic_denom(steering, p_n) + 1e-12)
 
     return p_sum
 
@@ -309,6 +312,22 @@ def _fine_ranges(
     return theta, phi, d
 
 
+def _srp_phat_azimuth(
+    audio_data: np.ndarray,
+    fs: float,
+    c: float,
+    angle_resolution: float = 0.5,
+) -> Tuple[np.ndarray, np.ndarray, float]:
+    """SRP-PHAT (как sound_direction.py) для оценки азимута 0–360°."""
+    from sound_direction import srp_phat_angle
+
+    segments = [audio_data[m].astype(np.float64) for m in range(NUM_MICS)]
+    angles_deg, power, best_angle = srp_phat_angle(
+        segments, fs, c, angle_resolution=angle_resolution
+    )
+    return angles_deg, power, best_angle
+
+
 def music_localization(
     audio_data: np.ndarray,
     fs: float,
@@ -327,8 +346,8 @@ def music_localization(
     """
     Локализация источника (coarse-to-fine, векторизованный MUSIC).
 
-    planar_mode=True (по умолчанию): 2D near-field для линейной решётки music.py,
-    азимут в legacy-градусах (от +Y), elevation=90°.
+    planar_mode=True (по умолчанию): круговая решётка, азимут 0–360° (как GCC-PHAT),
+    сначала дальнее поле по углу, затем near-field по расстоянию.
     full_3d=True: полная сетка (θ, φ, d) по instruction.md.
     """
     if audio_data.shape[0] != NUM_MICS:
@@ -362,36 +381,50 @@ def music_localization(
     use_planar = planar_mode and not full_3d
 
     if use_planar:
-        # --- Planar coarse (θ: -90..90, d) ---
-        az_c = np.arange(-90.0, 90.0 + 1e-9, 5.0)
+        # --- DOA: SRP-PHAT, 0–360° (sound_direction.py) ---
+        x_doa = audio_data - np.mean(audio_data, axis=1, keepdims=True)
+        az_c, spec_az_coarse, _ = _srp_phat_azimuth(x_doa, fs, c, angle_resolution=2.0)
+        az_f, spec_az_fine, az_best = _srp_phat_azimuth(x_doa, fs, c, angle_resolution=0.5)
+
+        # --- Расстояние: near-field MUSIC при фиксированном азимуте ---
         d_c = np.arange(d_min, d_max + 1e-9, 0.2)
-        sx, sy, sz, d_flat = _grid_positions_planar(az_c, d_c)
-        spec_coarse = _music_spectrum_on_grid(
+        sx, sy, sz, d_flat = _grid_positions_circular_planar(np.array([az_best]), d_c)
+        spec_d_coarse = _music_spectrum_on_grid(
             sx, sy, sz, d_flat, mic_x, mic_y, mic_z, projectors, freqs_used, c
         )
-        i_a, i_d, _ = _argmax_planar(spec_coarse, az_c, d_c)
-        az_peak = float(az_c[i_a])
-        d_peak = float(d_c[i_d])
+        d_peak = float(d_c[int(np.argmax(spec_d_coarse))])
 
-        az_f = np.clip(np.arange(az_peak - 10.0, az_peak + 10.0 + 0.5, 1.0), -90.0, 90.0)
         d_f = np.clip(np.arange(d_peak - 0.2, d_peak + 0.2 + 0.005, 0.01), d_min, d_max)
-        sx, sy, sz, d_flat = _grid_positions_planar(az_f, d_f)
-        spec_fine = _music_spectrum_on_grid(
+        sx, sy, sz, d_flat = _grid_positions_circular_planar(np.array([az_best]), d_f)
+        spec_d_fine = _music_spectrum_on_grid(
             sx, sy, sz, d_flat, mic_x, mic_y, mic_z, projectors, freqs_used, c
         )
-        j_a, j_d, peak_val = _argmax_planar(spec_fine, az_f, d_f)
+        d_best = float(d_f[int(np.argmax(spec_d_fine))])
+        peak_val = float(np.max(spec_az_fine))
 
-        az_legacy = float(az_f[j_a])
         result = MusicResult(
-            azimuth_deg=az_legacy,
+            azimuth_deg=az_best,
             elevation_deg=90.0,
-            distance_m=float(d_f[j_d]),
+            distance_m=d_best,
         )
         if return_diagnostics:
-            result.spectrum_coarse = spec_coarse.reshape(len(az_c), len(d_c))
-            result.spectrum_fine = spec_fine.reshape(len(az_f), len(d_f))
-            result.grid_coarse = {"theta": az_c, "phi": np.array([90.0]), "d": d_c, "planar": True}
-            result.grid_fine = {"theta": az_f, "phi": np.array([90.0]), "d": d_f, "planar": True}
+            result.spectrum_coarse = spec_az_coarse
+            result.spectrum_fine = spec_az_fine
+            result.grid_coarse = {
+                "theta": az_c,
+                "phi": np.array([90.0]),
+                "d": d_c,
+                "planar": True,
+                "doa_only": True,
+            }
+            result.grid_fine = {
+                "theta": az_f,
+                "phi": np.array([90.0]),
+                "d": d_f,
+                "planar": True,
+                "doa_only": True,
+                "azimuth_fixed": az_best,
+            }
     else:
         # --- Full 3D coarse-to-fine (instruction.md) ---
         theta_c = np.arange(0.0, 360.0, 5.0)

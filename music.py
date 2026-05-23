@@ -32,7 +32,7 @@ def process_file(
     *,
     c: float = C_SOUND_DEFAULT,
     block_start: int = 0,
-    block_len: int = 88200,
+    block_len: int = 44100,
     num_sources: int = 1,
     visual: bool = False,
     visual_dir: str | None = None,
@@ -77,7 +77,7 @@ def batch_process(
     *,
     c: float = C_SOUND_DEFAULT,
     block_start: int = 0,
-    block_len: int = 88200,
+    block_len: int = 44100,
     num_sources: int = 1,
     visual: bool = False,
     visual_root: str = "visualizations",
@@ -178,7 +178,7 @@ def main() -> None:
     )
     parser.add_argument("--speed-of-sound", type=float, default=C_SOUND_DEFAULT, metavar="C")
     parser.add_argument("--block-start", type=int, default=0)
-    parser.add_argument("--block-len", type=int, default=88200)
+    parser.add_argument("--block-len", type=int, default=44100)
     parser.add_argument("--num-sources", type=int, default=1)
     parser.add_argument(
         "--visual",
@@ -242,6 +242,8 @@ def main() -> None:
         )
         print("\n" + "=" * 60)
         print(" LOCALIZATION RESULT")
+        print(f"  Направление звука: {row['azimuth_deg']}°")
+        print(f"  (0° = правее центра массива, против часовой стрелки)")
         print(f"  Azimuth (deg):    {row['azimuth_deg']}")
         print(f"  Elevation (deg):  {row['elevation_deg']}")
         print(f"  Distance (m):     {row['distance_m']}")

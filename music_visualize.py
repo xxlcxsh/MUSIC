@@ -123,7 +123,10 @@ def _plot_spectrum_slices(
     spec_db = 10 * np.log10(spectrum / (spectrum.max() + 1e-12) + 1e-12)
 
     if grid.get("planar"):
-        _plot_planar_spectrum(spec_db, theta, d, az, dist, stage, out_dir, prefix, idx, ground_truth)
+        if spec_db.ndim == 1:
+            _plot_srp_azimuth_spectrum(spec_db, theta, az, stage, out_dir, prefix, idx)
+        else:
+            _plot_planar_spectrum(spec_db, theta, d, az, dist, stage, out_dir, prefix, idx, ground_truth)
         return
 
     i_phi = int(np.argmin(np.abs(phi - el)))
@@ -195,8 +198,8 @@ def _plot_spectrum_slices(
 def _plot_geometry_3d(result: MusicResult, path: str, ground_truth: Optional[tuple[float, float]]) -> None:
     d = result.distance_m
     az = np.deg2rad(result.azimuth_deg)
-    sx = d * np.sin(az)
-    sy = d * np.cos(az)
+    sx = d * np.cos(az)
+    sy = d * np.sin(az)
     sz = 0.0
 
     fig = plt.figure(figsize=(9, 8))
@@ -211,8 +214,8 @@ def _plot_geometry_3d(result: MusicResult, path: str, ground_truth: Optional[tup
     if ground_truth:
         gt_az = np.deg2rad(ground_truth[0])
         gt_d = ground_truth[1]
-        gx = gt_d * np.sin(gt_az)
-        gy = gt_d * np.cos(gt_az)
+        gx = gt_d * np.cos(gt_az)
+        gy = gt_d * np.sin(gt_az)
         ax.scatter([gx], [gy], [0], c="lime", marker="^", s=120, label="Эталон (legacy)")
 
     ax.plot([0, sx], [0, sy], [0, sz], "r--", alpha=0.5)
@@ -226,6 +229,26 @@ def _plot_geometry_3d(result: MusicResult, path: str, ground_truth: Optional[tup
     ax.set_ylim(-lim, lim)
     ax.set_zlim(-0.05, lim)
     _savefig(path)
+
+
+def _plot_srp_azimuth_spectrum(
+    spec_db: np.ndarray,
+    azimuth_deg: np.ndarray,
+    az: float,
+    stage: str,
+    out_dir: str,
+    prefix: str,
+    idx: str,
+) -> None:
+    fig, ax = plt.subplots(figsize=(10, 4))
+    ax.plot(azimuth_deg, spec_db, color="tab:blue")
+    ax.axvline(az, color="cyan", ls="--", label=f"пик {az:.1f}°")
+    ax.set_xlabel("Азимут (0° = +X, ПЧС), °")
+    ax.set_ylabel("dB отн. макс.")
+    ax.set_title(f"{stage}: SRP-PHAT по азимуту")
+    ax.grid(True, alpha=0.3)
+    ax.legend()
+    _savefig(os.path.join(out_dir, f"{prefix}{idx}_srp_azimuth.png"))
 
 
 def _plot_planar_spectrum(
@@ -245,7 +268,7 @@ def _plot_planar_spectrum(
     ax.scatter([az], [dist], c="cyan", marker="x", s=120, linewidths=2, label="Оценка")
     if ground_truth:
         ax.scatter([ground_truth[0]], [ground_truth[1]], c="lime", marker="+", s=120, linewidths=2, label="Эталон")
-    ax.set_xlabel("Азимут (legacy, от +Y), °")
+    ax.set_xlabel("Азимут (0° = +X, ПЧС), °")
     ax.set_ylabel("Расстояние d, м")
     ax.set_title(f"{stage}: планарный MUSIC (азимут–расстояние)")
     fig.colorbar(pcm, ax=ax, label="dB отн. макс.")
@@ -278,10 +301,14 @@ def _plot_polar_azimuth(result: MusicResult, path: str) -> None:
     grid = result.grid_fine
     if grid.get("planar"):
         theta = np.deg2rad(grid["theta"])
-        d = grid["d"]
         spec = result.spectrum_fine
-        i_d = int(np.argmin(np.abs(d - result.distance_m)))
-        slice_theta = spec[:, i_d]
+        if spec.ndim == 1:
+            slice_theta = 10 * np.log10(spec / (spec.max() + 1e-12) + 1e-12)
+        else:
+            d = grid["d"]
+            i_d = int(np.argmin(np.abs(d - result.distance_m)))
+            slice_theta = spec[:, i_d]
+            slice_theta = 10 * np.log10(slice_theta / (slice_theta.max() + 1e-12) + 1e-12)
     else:
         theta = np.deg2rad(grid["theta"])
         phi = grid["phi"]

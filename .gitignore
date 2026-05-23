@@ -11,6 +11,7 @@ visualizations/
 viz_test/
 test_batch.csv
 music_results_*.csv
+direction_result.png
 
 # IDE
 .idea/
