@@ -245,7 +245,7 @@ def _plot_srp_azimuth_spectrum(
     ax.axvline(az, color="cyan", ls="--", label=f"пик {az:.1f}°")
     ax.set_xlabel("Азимут (0° = +X, ПЧС), °")
     ax.set_ylabel("dB отн. макс.")
-    ax.set_title(f"{stage}: SRP-PHAT по азимуту")
+    ax.set_title(f"{stage}: MUSIC по азимуту")
     ax.grid(True, alpha=0.3)
     ax.legend()
     _savefig(os.path.join(out_dir, f"{prefix}{idx}_srp_azimuth.png"))

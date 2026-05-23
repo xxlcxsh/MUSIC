@@ -4,8 +4,10 @@
 
 from __future__ import annotations
 
-import glob
 import os
+import sqlite3
+import struct
+import warnings
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass
 from typing import Optional, Tuple
@@ -13,7 +15,15 @@ from typing import Optional, Tuple
 import numpy as np
 import scipy.signal as sig
 
-# --- Геометрия: 8 микрофонов на окружности (как sound_direction.py) ---
+try:
+    import soundfile as sf
+
+    HAS_SF = True
+except ImportError:
+    sf = None
+    HAS_SF = False
+
+# --- Геометрия: 8 микрофонов на окружности ---
 NUM_MICS = 8
 ARRAY_RADIUS_M = 0.5  # м, диаметр 1 м
 _MIC_ANGLES = np.linspace(0.0, 2.0 * np.pi, NUM_MICS, endpoint=False)
@@ -31,6 +41,8 @@ D_MAX_DEFAULT = 3.0
 
 STFT_NPERSEG = 1024
 STFT_NOVERLAP = 512  # 50 %
+
+_AU_DTYPE_MAP = {2: np.int8, 3: np.int16, 5: np.int32, 6: np.float32, 7: np.float64}
 
 
 @dataclass
@@ -52,6 +64,101 @@ def _exchange_matrix(m: int) -> np.ndarray:
 
 
 _J8 = _exchange_matrix(NUM_MICS)
+
+
+def _read_au_block(au_path: str) -> np.ndarray:
+    """Читает Audacity .au блок как массив float32."""
+    if HAS_SF:
+        try:
+            data, _ = sf.read(au_path, always_2d=False, dtype="float32")
+            return np.asarray(data, dtype=np.float32)
+        except Exception:
+            pass
+
+    with open(au_path, "rb") as handle:
+        raw = handle.read()
+    if len(raw) < 4:
+        return np.zeros(0, dtype=np.float32)
+
+    snd_magic = 0x2E736E64
+
+    def _parse(endian: str) -> np.ndarray:
+        magic, offset, _, encoding, _, _ = struct.unpack_from(f"{endian}IIIIII", raw)
+        if magic != snd_magic or encoding not in _AU_DTYPE_MAP:
+            raise ValueError
+        dtype = np.dtype(_AU_DTYPE_MAP[encoding]).newbyteorder(endian)
+        samples = np.frombuffer(raw, dtype=dtype, offset=offset)
+        if samples.dtype.kind in ("i", "u"):
+            samples = samples.astype(np.float32) / np.iinfo(samples.dtype).max
+        return samples.astype(np.float32)
+
+    for endian in (">", "<"):
+        try:
+            return _parse(endian)
+        except Exception:
+            pass
+
+    warnings.warn(f"Fallback raw int16: {os.path.basename(au_path)}")
+    return np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+
+
+def _load_track(block_files: list[str]) -> np.ndarray:
+    return np.concatenate([_read_au_block(path) for path in block_files])
+
+
+def load_aup_xml(aup_path: str):
+    """Загрузка Audacity .aup проекта и связанных .au блоков."""
+    tree = ET.parse(aup_path)
+    root = tree.getroot()
+    rate = float(root.get("rate", 44100))
+    base_dir = os.path.dirname(os.path.abspath(aup_path))
+    uri = root.tag.split("}")[0].lstrip("{") if "}" in root.tag else ""
+
+    def tag(name: str) -> str:
+        return f"{{{uri}}}{name}" if uri else name
+
+    tracks: list[np.ndarray] = []
+    for wavetrack in root.iter(tag("wavetrack")):
+        blocks: dict[int, str] = {}
+        for seq in wavetrack.iter(tag("sequence")):
+            for blk in seq.iter(tag("simpleblockfile")):
+                fname = blk.get("filename")
+                offset = int(blk.get("start", 0))
+                if fname:
+                    for dirpath, _, files in os.walk(base_dir):
+                        if fname in files:
+                            blocks[offset] = os.path.join(dirpath, fname)
+                            break
+        if blocks:
+            tracks.append(_load_track([blocks[k] for k in sorted(blocks)]))
+
+    if not tracks:
+        raise RuntimeError("Треки не найдены. Убедитесь что папка _data находится рядом с .aup файлом.")
+    return tracks, rate
+
+
+def load_aup3_sqlite(path: str):
+    """Загрузка Audacity .aup3 проекта через SQLite."""
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    try:
+        cur.execute("SELECT dict FROM project LIMIT 1")
+        import json
+
+        rate = float(json.loads(cur.fetchone()[0]).get("rate", 44100))
+    except Exception:
+        rate = 44100.0
+    cur.execute("SELECT DISTINCT trackid FROM sampleblocks ORDER BY trackid")
+    tracks: list[np.ndarray] = []
+    for (tid,) in cur.fetchall():
+        cur.execute("SELECT samples FROM sampleblocks WHERE trackid=? ORDER BY blockid", (tid,))
+        parts = [np.frombuffer(blob, dtype="<f4") for (blob,) in cur.fetchall()]
+        if parts:
+            tracks.append(np.concatenate(parts))
+    con.close()
+    if not tracks:
+        raise RuntimeError("Нет блоков в .aup3 файле")
+    return tracks, rate
 
 
 def read_audacity_au_block(au_path: str, num_samples: Optional[int] = None) -> np.ndarray:
@@ -100,9 +207,6 @@ def load_audacity_or_wav(filepath: str) -> Tuple[np.ndarray, float]:
         return x.astype(np.float64), float(sr)
 
     if ext == ".aup":
-        # Та же загрузка, что в sound_direction.py (simpleblockfile + os.walk + AU/SF).
-        from sound_direction import load_aup_xml
-
         tracks, sr = load_aup_xml(filepath)
         if len(tracks) < NUM_MICS:
             raise ValueError(f"В проекте {len(tracks)} дорожек, требуется {NUM_MICS}.")
@@ -111,7 +215,12 @@ def load_audacity_or_wav(filepath: str) -> Tuple[np.ndarray, float]:
         return x, float(sr)
 
     if ext == ".aup3":
-        raise NotImplementedError("Формат .aup3 не поддерживается. Экспортируйте в WAV.")
+        tracks, sr = load_aup3_sqlite(filepath)
+        if len(tracks) < NUM_MICS:
+            raise ValueError(f"В проекте {len(tracks)} дорожек, требуется {NUM_MICS}.")
+        min_len = min(len(t) for t in tracks[:NUM_MICS])
+        x = np.array([tracks[i][:min_len] for i in range(NUM_MICS)], dtype=np.float64)
+        return x, float(sr)
     raise ValueError(f"Неподдерживаемое расширение: {ext}")
 
 
@@ -190,7 +299,7 @@ def _grid_positions_circular_planar(
     d_m: np.ndarray,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """
-    Источник в плоскости XY; азимут — как в sound_direction.py:
+    Источник в плоскости XY; азимут в системе 0°..360°:
     0° = ось +X, против часовой стрелки; x = d·cos(θ), y = d·sin(θ).
     """
     tt, dd = np.meshgrid(np.deg2rad(azimuth_deg), d_m, indexing="ij")
@@ -312,22 +421,6 @@ def _fine_ranges(
     return theta, phi, d
 
 
-def _srp_phat_azimuth(
-    audio_data: np.ndarray,
-    fs: float,
-    c: float,
-    angle_resolution: float = 0.5,
-) -> Tuple[np.ndarray, np.ndarray, float]:
-    """SRP-PHAT (как sound_direction.py) для оценки азимута 0–360°."""
-    from sound_direction import srp_phat_angle
-
-    segments = [audio_data[m].astype(np.float64) for m in range(NUM_MICS)]
-    angles_deg, power, best_angle = srp_phat_angle(
-        segments, fs, c, angle_resolution=angle_resolution
-    )
-    return angles_deg, power, best_angle
-
-
 def music_localization(
     audio_data: np.ndarray,
     fs: float,
@@ -346,8 +439,8 @@ def music_localization(
     """
     Локализация источника (coarse-to-fine, векторизованный MUSIC).
 
-    planar_mode=True (по умолчанию): круговая решётка, азимут 0–360° (как GCC-PHAT),
-    сначала дальнее поле по углу, затем near-field по расстоянию.
+    planar_mode=True (по умолчанию): круговая решётка, MUSIC-поиск по азимуту
+    и расстоянию в плоскости XY с coarse-to-fine сеткой.
     full_3d=True: полная сетка (θ, φ, d) по instruction.md.
     """
     if audio_data.shape[0] != NUM_MICS:
@@ -381,50 +474,35 @@ def music_localization(
     use_planar = planar_mode and not full_3d
 
     if use_planar:
-        # --- DOA: SRP-PHAT, 0–360° (sound_direction.py) ---
-        x_doa = audio_data - np.mean(audio_data, axis=1, keepdims=True)
-        az_c, spec_az_coarse, _ = _srp_phat_azimuth(x_doa, fs, c, angle_resolution=2.0)
-        az_f, spec_az_fine, az_best = _srp_phat_azimuth(x_doa, fs, c, angle_resolution=0.5)
-
-        # --- Расстояние: near-field MUSIC при фиксированном азимуте ---
+        # --- Планарный MUSIC: азимут + расстояние на круговой решётке ---
+        az_c = np.arange(0.0, 360.0, 5.0)
         d_c = np.arange(d_min, d_max + 1e-9, 0.2)
-        sx, sy, sz, d_flat = _grid_positions_circular_planar(np.array([az_best]), d_c)
-        spec_d_coarse = _music_spectrum_on_grid(
+        sx, sy, sz, d_flat = _grid_positions_circular_planar(az_c, d_c)
+        spec_coarse = _music_spectrum_on_grid(
             sx, sy, sz, d_flat, mic_x, mic_y, mic_z, projectors, freqs_used, c
         )
-        d_peak = float(d_c[int(np.argmax(spec_d_coarse))])
+        i_az, i_d, _ = _argmax_planar(spec_coarse, az_c, d_c)
+        az_peak = float(az_c[i_az])
+        d_peak = float(d_c[i_d])
 
+        az_f = _fine_azimuth_range(az_peak, 10.0, 1.0)
         d_f = np.clip(np.arange(d_peak - 0.2, d_peak + 0.2 + 0.005, 0.01), d_min, d_max)
-        sx, sy, sz, d_flat = _grid_positions_circular_planar(np.array([az_best]), d_f)
-        spec_d_fine = _music_spectrum_on_grid(
+        sx, sy, sz, d_flat = _grid_positions_circular_planar(az_f, d_f)
+        spec_fine = _music_spectrum_on_grid(
             sx, sy, sz, d_flat, mic_x, mic_y, mic_z, projectors, freqs_used, c
         )
-        d_best = float(d_f[int(np.argmax(spec_d_fine))])
-        peak_val = float(np.max(spec_az_fine))
+        j_az, j_d, peak_val = _argmax_planar(spec_fine, az_f, d_f)
 
         result = MusicResult(
-            azimuth_deg=az_best,
+            azimuth_deg=float(az_f[j_az]),
             elevation_deg=90.0,
-            distance_m=d_best,
+            distance_m=float(d_f[j_d]),
         )
         if return_diagnostics:
-            result.spectrum_coarse = spec_az_coarse
-            result.spectrum_fine = spec_az_fine
-            result.grid_coarse = {
-                "theta": az_c,
-                "phi": np.array([90.0]),
-                "d": d_c,
-                "planar": True,
-                "doa_only": True,
-            }
-            result.grid_fine = {
-                "theta": az_f,
-                "phi": np.array([90.0]),
-                "d": d_f,
-                "planar": True,
-                "doa_only": True,
-                "azimuth_fixed": az_best,
-            }
+            result.spectrum_coarse = spec_coarse.reshape(len(az_c), len(d_c))
+            result.spectrum_fine = spec_fine.reshape(len(az_f), len(d_f))
+            result.grid_coarse = {"theta": az_c, "phi": np.array([90.0]), "d": d_c, "planar": True}
+            result.grid_fine = {"theta": az_f, "phi": np.array([90.0]), "d": d_f, "planar": True}
     else:
         # --- Full 3D coarse-to-fine (instruction.md) ---
         theta_c = np.arange(0.0, 360.0, 5.0)
